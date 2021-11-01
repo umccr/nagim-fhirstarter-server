@@ -12,6 +12,7 @@ import com.nimbusds.jose.jwk.JWK;
 import com.nimbusds.jose.jwk.JWKMatcher;
 import com.nimbusds.jose.jwk.JWKSelector;
 import com.nimbusds.jose.jwk.OctetKeyPair;
+import com.nimbusds.jose.jwk.source.DefaultJWKSetCache;
 import com.nimbusds.jose.jwk.source.JWKSource;
 import com.nimbusds.jose.jwk.source.RemoteJWKSet;
 import com.nimbusds.jose.proc.JWSKeySelector;
@@ -33,6 +34,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.net.URL;
 
+import org.hl7.fhir.r4.model.Patient;
+import org.hl7.fhir.r4.model.Specimen;
 import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -51,6 +54,18 @@ public class PassportVisaAuthorizationInterceptor extends AuthorizationIntercept
     private static final String VISA_TRUSTED_ISSUER = "https://didact-patto.dev.umccr.org";
     private static final String VISA_TRUSTED_JWKS = "https://didact-patto.dev.umccr.org/.well-known/jwks";
 
+    // because our ecosystem is just a prototype we use serverless tech - which has some horrible cold start times
+    // so need to make sure this is higher than normal - because when it fetches the JWKS files it will otherwise
+    // timeout
+    private static final int TIMEOUT_MS = 10000;
+
+    // and we also cache jwks pretty hard (see above)
+    private final DefaultJWKSetCache cache;
+
+    public PassportVisaAuthorizationInterceptor(DefaultJWKSetCache cache) {
+        this.cache = cache;
+    }
+
     @Override
     public List<IAuthRule> buildRuleList(RequestDetails theRequestDetails) {
 
@@ -58,6 +73,8 @@ public class PassportVisaAuthorizationInterceptor extends AuthorizationIntercept
         RuleBuilder builder = new RuleBuilder();
 
         builder.allow().metadata();
+        builder.allow().read().allResources().inCompartment("C", new IdType("Patient", "PUBLICLISA"));
+
 
         // Process this header
         String authHeader = theRequestDetails.getHeader("Authorization");
@@ -68,7 +85,7 @@ public class PassportVisaAuthorizationInterceptor extends AuthorizationIntercept
 
                 // step 1 is to verify the passport and if valid return the claims
                 // the passport processor is configured to do all this for us
-                JWTClaimsSet claimsSet = getPassportProcessor(PASSPORT_ISSUER, PASSPORT_JWKS).process(token, null);
+                JWTClaimsSet claimsSet = getPassportProcessor(PASSPORT_ISSUER, new URL(PASSPORT_JWKS)).process(token, null);
 
                 // our claims now need to be decomposed into a set of visas from different issuers
                 Map<String, Object> ga4ghMap = (Map<String, Object>) claimsSet.getClaim("ga4gh");
@@ -86,7 +103,7 @@ public class PassportVisaAuthorizationInterceptor extends AuthorizationIntercept
                 byte[] signatureBytes = Base64.getUrlDecoder().decode(authVisaMap.get("s"));
 
                 // make a verifier object that fetches the corresponding keys and is all initialised
-                Ed25519Signer visaVerifier = getVisaVerifier(VISA_TRUSTED_ISSUER, VISA_TRUSTED_JWKS, authVisaMap.get("k"));
+                Ed25519Signer visaVerifier = getVisaVerifier(VISA_TRUSTED_ISSUER, new URL(VISA_TRUSTED_JWKS), authVisaMap.get("k"));
 
                 // update the verifier with the visa content
                 visaVerifier.update(vBytes, 0, vBytes.length);
@@ -98,17 +115,25 @@ public class PassportVisaAuthorizationInterceptor extends AuthorizationIntercept
                         if (x.startsWith("c:")) {
                             String manifestId = x.substring(2);
 
-                            try(java.io.InputStream is = new java.net.URL(String.format("%s/api/manifest/%s", VISA_TRUSTED_ISSUER, manifestId)).openStream()) {
+                            try (java.io.InputStream is = new java.net.URL(String.format("%s/api/manifest/%s", VISA_TRUSTED_ISSUER, manifestId)).openStream()) {
                                 String contents = new String(is.readAllBytes());
 
                                 JSONObject jo = new JSONObject(contents);
 
+                                JSONObject artifacts = jo.getJSONObject("htsgetArtifacts");
+
+                                for(String k : artifacts.keySet()) {
+                                    builder.allow().read().instance(new IdType("Patient", k));
+
+                                    builder.allow().read().allResources().inCompartment("All", new IdType("Patient", k));
+                                    builder.allow().read().allResources().inCompartment("Specimen", new IdType("Patient", k));
+                                    builder.allow().read().allResources().inCompartment("Patient}", new IdType("Patient", k));
+
+
+                                }
+
                                 logger.info(jo.toString(2));
                             }
-
-                            // builder.allow()
-                            builder.allow().read().allResources().withAnyId().andThen()
-                                    .allow().write().resourcesOfType(Observation.class).inCompartment("Patient", new IdType("Patient/123"));
                         }
                     }
 
@@ -118,19 +143,36 @@ public class PassportVisaAuthorizationInterceptor extends AuthorizationIntercept
             logger.error(e.toString());
         }
 
+        logger.info(builder.build().toString());
+
+
         return builder.build();
     }
 
-    private Ed25519Signer getVisaVerifier(String iss, String jwksUrl, String kid) throws Exception {
-        JWKSource<SecurityContext> keySource =
-                new RemoteJWKSet<>(new URL(jwksUrl), new DefaultResourceRetriever(5000, 5000));
+    /**
+     * Create a Edwards Curve Signer instance that will verify GA4GH plain text visas.
+     *
+     * @param iss   the expected issuer of the visas
+     * @param jwksUrl  the known JWKS url for the issuer
+     * @param kid   the kid to verify against (will have been included somehow in the visa)
+     * @param <T> an unused SecurityContext type
+     * @return a Signer object that can be used to verify the signature (only) of incoming visas
+     * @throws KeySourceException problems locating key
+     */
+    private <T extends SecurityContext> Ed25519Signer getVisaVerifier(String iss, URL jwksUrl, String kid) throws KeySourceException  {
+        JWKSource<T> keySource =
+                new RemoteJWKSet<>(jwksUrl, new DefaultResourceRetriever(TIMEOUT_MS, TIMEOUT_MS), cache);
 
-        JWKSelector keySelector = new JWKSelector(new JWKMatcher.Builder().algorithm(JWSAlgorithm.EdDSA).keyID(kid).build());
+        JWKSelector keySelector = new JWKSelector(
+                new JWKMatcher.Builder()
+                        .algorithm(JWSAlgorithm.EdDSA)
+                        .keyID(kid)
+                        .build());
 
         List<JWK> visaKeys = keySource.get(keySelector, null);
 
         if (visaKeys.size() != 1)
-            throw new Exception("Did not find corresponding key for kid");
+            throw new KeySourceException("Did not find corresponding key for kid");
 
         // the Java crypto libraries (as of October 2021) don't have complete Edwards Curve support.. so whilst
         // I think they can generate/verify signatures - the support around constructing public key objects is
@@ -149,14 +191,23 @@ public class PassportVisaAuthorizationInterceptor extends AuthorizationIntercept
         return visaVerifier;
     }
 
-    private ConfigurableJWTProcessor<SecurityContext> getPassportProcessor(String iss, String jwksUrl) throws java.net.MalformedURLException {
-        ConfigurableJWTProcessor<SecurityContext> jwtProcessor =
-                new DefaultJWTProcessor<>();
+    /**
+     * Creates a JWT processor that will verify GA4GH passport JWTs.
+     *
+     * @param iss     the expected issuer of the passport
+     * @param jwksUrl the known JWKS url for the issuer
+     * @param <T> an unused SecurityContext type
+     * @return a JWT processor that can be used to verify incoming JWTs
+     * @implNote In real world we would probably use OIDC discovery to work out the JWKS url - but for prototyping we
+     * can skip that call
+     */
+    private <T extends SecurityContext> ConfigurableJWTProcessor<T> getPassportProcessor(String iss, URL jwksUrl) {
+        ConfigurableJWTProcessor<T> jwtProcessor = new DefaultJWTProcessor<>();
 
-        JWKSource<SecurityContext> keySource =
-                new RemoteJWKSet<>(new URL(jwksUrl), new DefaultResourceRetriever(5000, 5000));
+        JWKSource<T> keySource =
+                new RemoteJWKSet<>(jwksUrl, new DefaultResourceRetriever(TIMEOUT_MS, TIMEOUT_MS), cache);
 
-        // whilst we are currently only using RS256, there is no reason we should not allow others
+        // whilst we are currently only using RS256, there is no reason we should not allow the whole RSA family
         Set<JWSAlgorithm> expectedAlgSet = new HashSet<>();
         expectedAlgSet.add(JWSAlgorithm.RS256);
         expectedAlgSet.add(JWSAlgorithm.RS384);
@@ -164,14 +215,13 @@ public class PassportVisaAuthorizationInterceptor extends AuthorizationIntercept
 
         // Configure the JWT processor with a key selector to feed matching public
         // RSA keys sourced from the JWK set URL
-        JWSKeySelector<SecurityContext> keySelector =
-                new JWSVerificationKeySelector<>(expectedAlgSet, keySource);
+        JWSKeySelector<T> keySelector = new JWSVerificationKeySelector<T>(expectedAlgSet, keySource);
 
         jwtProcessor.setJWSKeySelector(keySelector);
 
         // Set the required JWT claims for access tokens issued by the Connect2id
         // server, may differ with other servers
-        jwtProcessor.setJWTClaimsSetVerifier(new DefaultJWTClaimsVerifier(
+        jwtProcessor.setJWTClaimsSetVerifier(new DefaultJWTClaimsVerifier<T>(
                 new JWTClaimsSet.Builder()
                         .issuer(iss)
                         .build(),
@@ -179,7 +229,6 @@ public class PassportVisaAuthorizationInterceptor extends AuthorizationIntercept
 
         return jwtProcessor;
     }
-
 
 
 }

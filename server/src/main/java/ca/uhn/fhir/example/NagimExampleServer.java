@@ -7,18 +7,22 @@ import ca.uhn.fhir.context.FhirContext;
 import ca.uhn.fhir.rest.server.RestfulServer;
 import ca.uhn.fhir.rest.server.interceptor.CorsInterceptor;
 import ca.uhn.fhir.rest.server.interceptor.ResponseHighlighterInterceptor;
+import com.nimbusds.jose.jwk.source.DefaultJWKSetCache;
 import org.springframework.web.cors.CorsConfiguration;
 
 import java.util.Arrays;
+import java.util.concurrent.TimeUnit;
 
 @WebServlet("/*")
 public class NagimExampleServer extends RestfulServer {
 
-	//@Autowired
-	//private PartitionSettings myPartitionSettings;
+	private DefaultJWKSetCache jwksCache;
 
 	@Override
 	protected void initialize() throws ServletException {
+		// for our demos we want a very long lasting cache for JWKS
+		jwksCache = new DefaultJWKSetCache(2L, 2L, TimeUnit.DAYS);
+
 		// Create a context for the appropriate version
 		setFhirContext(FhirContext.forR4());
 
@@ -55,7 +59,7 @@ public class NagimExampleServer extends RestfulServer {
 		// Register resource providers
 		registerProvider(new AghaPatientResourceProvider());
 
-		registerInterceptor(new PassportVisaAuthorizationInterceptor());
+		registerInterceptor(new PassportVisaAuthorizationInterceptor(jwksCache));
 
 		// Format the responses in nice HTML
 		registerInterceptor(new ResponseHighlighterInterceptor());
