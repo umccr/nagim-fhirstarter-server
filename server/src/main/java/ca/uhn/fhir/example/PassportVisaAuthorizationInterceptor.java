@@ -120,16 +120,19 @@ public class PassportVisaAuthorizationInterceptor extends AuthorizationIntercept
 
                                 JSONObject jo = new JSONObject(contents);
 
-                                JSONObject artifacts = jo.getJSONObject("htsgetArtifacts");
+                                String server = jo.getString("fhirUrl");
+                                JSONObject artifacts = jo.getJSONObject("fhirPatients");
 
-                                for(String k : artifacts.keySet()) {
-                                    builder.allow().read().instance(new IdType("Patient", k));
+                                // we should only apply the manifest rules if the manifest is a release for our endpoint
+                                if (Objects.equals(server, "https://fhir.dev.umccr.org")) {
+                                    for(String k : artifacts.keySet()) {
+                                        builder.allow().read().instance(new IdType("Patient", k));
 
-                                    builder.allow().read().allResources().inCompartment("All", new IdType("Patient", k));
-                                    builder.allow().read().allResources().inCompartment("Specimen", new IdType("Patient", k));
-                                    builder.allow().read().allResources().inCompartment("Patient}", new IdType("Patient", k));
-
-
+                                        // this is not yet working
+                                        builder.allow().read().allResources().inCompartment("All", new IdType("Patient", k));
+                                        builder.allow().read().allResources().inCompartment("Specimen", new IdType("Patient", k));
+                                        builder.allow().read().allResources().inCompartment("Patient}", new IdType("Patient", k));
+                                    }
                                 }
 
                                 logger.info(jo.toString(2));
@@ -142,9 +145,6 @@ public class PassportVisaAuthorizationInterceptor extends AuthorizationIntercept
         } catch (Exception e) {
             logger.error(e.toString());
         }
-
-        logger.info(builder.build().toString());
-
 
         return builder.build();
     }
