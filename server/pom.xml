@@ -11,7 +11,7 @@
 
     <properties>
         <hapifhir_version>5.4.2</hapifhir_version>
-        <spring_version>5.3.12</spring_version>
+        <spring_version>6.0.0</spring_version>
     </properties>
 
     <dependencies>
